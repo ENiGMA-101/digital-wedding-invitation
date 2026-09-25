@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { count, sql } from "drizzle-orm";
 import { db } from "@/db";
-import { rsvps } from "@/db/schema";
+import { reservations } from "@/db/schema";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -12,10 +12,10 @@ export async function GET() {
     const rows = await db
       .select({
         replies: count(),
-        attending: count(sql`case when ${rsvps.attendance} = 'attending' then 1 end`),
-        seats: sql<number>`coalesce(sum(case when ${rsvps.attendance} = 'attending' then ${rsvps.guests} else 0 end), 0)`,
+        attending: count(sql`case when ${reservations.attendance} = 'attending' then 1 end`),
+        seats: sql<number>`coalesce(sum(case when ${reservations.attendance} = 'attending' then ${reservations.guests} else 0 end), 0)`,
       })
-      .from(rsvps);
+      .from(reservations);
 
     const row = rows[0];
     return NextResponse.json({
@@ -49,7 +49,7 @@ export async function POST(request: Request) {
   }
 
   try {
-    await db.insert(rsvps).values({ name, guests, attendance, message }).execute();
+    await db.insert(reservations).values({ name, guests, attendance, message }).execute();
     return NextResponse.json({ ok: true, persisted: true, name, guests, attendance });
   } catch (error) {
     // Never break the guest experience if the database is unavailable.
