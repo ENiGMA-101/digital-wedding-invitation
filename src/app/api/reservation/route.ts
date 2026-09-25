@@ -7,7 +7,7 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 const SEATS_PER_TABLE = 10;
-const FIRST_GUEST_TABLE = 3; // Tables 01–02 are reserved for immediate family
+const FIRST_GUEST_TABLE = 3;
 const TOTAL_TABLES = 30;
 
 const BN_DIGITS = ["০", "১", "২", "৩", "৪", "৫", "৬", "৭", "৮", "৯"] as const;
@@ -20,90 +20,81 @@ export function pad2(n: number): string {
   return String(n).padStart(2, "0");
 }
 
-export function formatAllocation(tableNumber: number, seatStart: number, seatEnd: number) {
-  const tEn = `Table ${pad2(tableNumber)}`;
-  const tBn = `টেবিল ${toBanglaDigits(pad2(tableNumber))}`;
+export function formatAllocation(
+  tableNumber: number,
+  seatStart: number,
+  seatEnd: number,
+) {
+  const tableEn = `Table ${pad2(tableNumber)}`;
+  const tableBn = `টেবিল ${toBanglaDigits(pad2(tableNumber))}`;
 
-  const sEn =
+  const seatsEn =
     seatStart === seatEnd
       ? `Seat ${pad2(seatStart)}`
       : `Seats ${pad2(seatStart)}–${pad2(seatEnd)}`;
-  const sBn =
+
+  const seatsBn =
     seatStart === seatEnd
       ? `আসন ${toBanglaDigits(pad2(seatStart))}`
-      : `আসন ${toBanglaDigits(pad2(seatStart))}–${toBanglaDigits(pad2(seatEnd))}`;
+      : `আসন ${toBanglaDigits(pad2(seatStart))}–${toBanglaDigits(
+          pad2(seatEnd),
+        )}`;
 
   return {
-    tableEn: tEn,
-    tableBn: tBn,
-    seatsEn: sEn,
-    seatsBn: sBn,
-    seatLabelEn: `${tEn} / ${sEn}`,
-    seatLabelBn: `${tBn} / ${sBn}`,
+    tableEn,
+    tableBn,
+    seatsEn,
+    seatsBn,
+    seatLabelEn: `${tableEn} / ${seatsEn}`,
+    seatLabelBn: `${tableBn} / ${seatsBn}`,
   };
 }
 
-/**
- * Compute next available table & contiguous seat range for `guests` people
- * based on existing attending reservations in PostgreSQL.
- */
-async function allocateSeats(guests: number): Promise<{
-  tableNumber: number;
-  seatStart: number;
-  seatEnd: number;
-  seatLabelEn: string;
-  seatLabelBn: string;
-}> {
-  let existing: Array<{ tableNumber: number | null; seatStart: number | null; seatEnd: number | null; guests: number }> = [];
-  try {
-    existing = await db
-      .select({
-        tableNumber: reservations.tableNumber,
-        seatStart: reservations.seatStart,
-        seatEnd: reservations.seatEnd,
-        guests: reservations.guests,
-      })
-      .from(reservations)
-      .where(eq(reservations.attendance, "attending"))
-      .orderBy(asc(reservations.id));
-  } catch {
-    existing = [];
-  }
+async function allocateSeats(guests: number) {
+  const existing = await db
+    .select({
+      tableNumber: reservations.tableNumber,
+      seatStart: reservations.seatStart,
+      seatEnd: reservations.seatEnd,
+      guests: reservations.guests,
+    })
+    .from(reservations)
+    .where(eq(reservations.attendance, "attending"))
+    .orderBy(asc(reservations.id));
 
-  // Track highest occupied seat per table
   const tableOccupancy = new Map<number, number>();
+
   for (const row of existing) {
-    const t = row.tableNumber ?? FIRST_GUEST_TABLE;
-    const prev = tableOccupancy.get(t) ?? 0;
-    const used = row.seatEnd ?? prev + (row.guests || 1);
-    tableOccupancy.set(t, Math.max(prev, used));
+    if (!row.tableNumber) continue;
+
+    const previous = tableOccupancy.get(row.tableNumber) ?? 0;
+    const used =
+      row.seatEnd ?? previous + Math.max(row.guests ?? 1, 1);
+
+    tableOccupancy.set(row.tableNumber, Math.max(previous, used));
   }
 
-  let chosenTable = FIRST_GUEST_TABLE;
-  let seatStart = 1;
-  let seatEnd = guests;
+  for (let table = FIRST_GUEST_TABLE; table <= TOTAL_TABLES; table++) {
+    const used = tableOccupancy.get(table) ?? 0;
 
-  for (let t = FIRST_GUEST_TABLE; t <= TOTAL_TABLES; t++) {
-    const used = tableOccupancy.get(t) ?? 0;
     if (used + guests <= SEATS_PER_TABLE) {
-      chosenTable = t;
-      seatStart = used + 1;
-      seatEnd = used + guests;
-      break;
+      const seatStart = used + 1;
+      const seatEnd = used + guests;
+      const labels = formatAllocation(table, seatStart, seatEnd);
+
+      return {
+        tableNumber: table,
+        seatStart,
+        seatEnd,
+        seatLabelEn: labels.seatLabelEn,
+        seatLabelBn: labels.seatLabelBn,
+      };
     }
   }
 
-  const labels = formatAllocation(chosenTable, seatStart, seatEnd);
-  return {
-    tableNumber: chosenTable,
-    seatStart,
-    seatEnd,
-    seatLabelEn: labels.seatLabelEn,
-    seatLabelBn: labels.seatLabelBn,
-  };
+  throw new Error("No seats available.");
 }
 
-/** GET /api/reservation — summary of reservations, capacity, and recent seat allocations */
 export async function GET() {
   try {
     const rows = await db
@@ -112,92 +103,117 @@ export async function GET() {
       .orderBy(desc(reservations.createdAt))
       .limit(25);
 
-    const attendingRows = rows.filter((r) => r.attendance === "attending");
-    const totalSeatsReserved = attendingRows.reduce((acc, r) => acc + (r.guests || 0), 0);
+    const attendingRows = rows.filter(
+      (row) => row.attendance === "attending",
+    );
 
-    // Also compute next preview allocation for 1, 2, 4 guests
-    const nextForOne = await allocateSeats(1);
+    const totalSeatsReserved = attendingRows.reduce(
+      (total, row) => total + (row.guests || 0),
+      0,
+    );
+
+    let nextAvailableTable = FIRST_GUEST_TABLE;
+    let nextAvailableSeat = 1;
+
+    try {
+      const next = await allocateSeats(1);
+      nextAvailableTable = next.tableNumber;
+      nextAvailableSeat = next.seatStart;
+    } catch {
+      // No seats available.
+    }
 
     return NextResponse.json({
+      ok: true,
       totalReservations: rows.length,
       attendingCount: attendingRows.length,
       totalSeatsReserved,
-      totalCapacity: (TOTAL_TABLES - FIRST_GUEST_TABLE + 1) * SEATS_PER_TABLE,
+      totalCapacity:
+        (TOTAL_TABLES - FIRST_GUEST_TABLE + 1) * SEATS_PER_TABLE,
       seatsPerTable: SEATS_PER_TABLE,
-      nextAvailableTable: nextForOne.tableNumber,
-      nextAvailableSeat: nextForOne.seatStart,
-      recentAllocations: attendingRows.slice(0, 6).map((r) => ({
-        id: r.id,
-        name: r.name,
-        guests: r.guests,
-        tableNumber: r.tableNumber ?? FIRST_GUEST_TABLE,
-        seatStart: r.seatStart ?? 1,
-        seatEnd: r.seatEnd ?? r.guests,
-        seatLabelEn: r.seatLabelEn ?? formatAllocation(r.tableNumber ?? FIRST_GUEST_TABLE, r.seatStart ?? 1, r.seatEnd ?? r.guests).seatLabelEn,
-        seatLabelBn: r.seatLabelBn ?? formatAllocation(r.tableNumber ?? FIRST_GUEST_TABLE, r.seatStart ?? 1, r.seatEnd ?? r.guests).seatLabelBn,
+      nextAvailableTable,
+      nextAvailableSeat,
+      recentAllocations: attendingRows.slice(0, 6).map((row) => ({
+        id: row.id,
+        name: row.name,
+        guests: row.guests,
+        tableNumber: row.tableNumber,
+        seatStart: row.seatStart,
+        seatEnd: row.seatEnd,
+        seatLabelEn: row.seatLabelEn,
+        seatLabelBn: row.seatLabelBn,
       })),
     });
-  } catch {
-    const fallback = formatAllocation(FIRST_GUEST_TABLE, 1, 1);
-    return NextResponse.json({
-      totalReservations: 0,
-      attendingCount: 0,
-      totalSeatsReserved: 0,
-      totalCapacity: (TOTAL_TABLES - FIRST_GUEST_TABLE + 1) * SEATS_PER_TABLE,
-      seatsPerTable: SEATS_PER_TABLE,
-      nextAvailableTable: FIRST_GUEST_TABLE,
-      nextAvailableSeat: 1,
-      recentAllocations: [],
-      nextPreview: fallback,
-      degraded: true,
-    });
+  } catch (error) {
+    console.error("reservation.get.failed", error);
+
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "Unable to load reservations.",
+      },
+      { status: 500 },
+    );
   }
 }
 
-/** POST /api/reservation — create a wedding reservation & allocate table + seats */
 export async function POST(request: Request) {
-  let payload: unknown;
   try {
-    payload = await request.json();
-  } catch {
-    return NextResponse.json({ error: "Invalid request payload." }, { status: 400 });
-  }
+    const payload = await request.json();
+    const body = (payload ?? {}) as Record<string, unknown>;
 
-  const body = (payload ?? {}) as Record<string, unknown>;
-  const name = typeof body.name === "string" ? body.name.trim().slice(0, 140) : "";
-  const phone = typeof body.phone === "string" ? body.phone.trim().slice(0, 40) : "";
-  const rawGuests = Number(body.guests ?? 1);
-  const guests = Number.isFinite(rawGuests) ? Math.min(Math.max(Math.round(rawGuests), 1), 10) : 1;
-  const attendance = body.attendance === "declined" ? "declined" : "attending";
-  const message =
-    typeof body.message === "string" ? body.message.trim().slice(0, 500) || null : null;
+    const name =
+      typeof body.name === "string"
+        ? body.name.trim().slice(0, 140)
+        : "";
 
-  if (name.length < 2) {
-    return NextResponse.json({ error: "Please provide your name." }, { status: 422 });
-  }
-  if (phone.length < 6) {
-    return NextResponse.json({ error: "Please provide a valid mobile number." }, { status: 422 });
-  }
+    const phone =
+      typeof body.phone === "string"
+        ? body.phone.trim().slice(0, 40)
+        : "";
 
-  let allocation: {
-    tableNumber: number | null;
-    seatStart: number | null;
-    seatEnd: number | null;
-    seatLabelEn: string | null;
-    seatLabelBn: string | null;
-  } = {
-    tableNumber: null,
-    seatStart: null,
-    seatEnd: null,
-    seatLabelEn: null,
-    seatLabelBn: null,
-  };
+    const rawGuests = Number(body.guests ?? 1);
 
-  if (attendance === "attending") {
-    allocation = await allocateSeats(guests);
-  }
+    const guests = Number.isFinite(rawGuests)
+      ? Math.min(Math.max(Math.round(rawGuests), 1), 10)
+      : 1;
 
-  try {
+    const attendance =
+      body.attendance === "declined"
+        ? "declined"
+        : "attending";
+
+    const message =
+      typeof body.message === "string"
+        ? body.message.trim().slice(0, 500) || null
+        : null;
+
+    if (name.length < 2) {
+      return NextResponse.json(
+        { error: "Please provide your name." },
+        { status: 422 },
+      );
+    }
+
+    if (phone.length < 6) {
+      return NextResponse.json(
+        { error: "Please provide a valid mobile number." },
+        { status: 422 },
+      );
+    }
+
+    let allocation = {
+      tableNumber: null as number | null,
+      seatStart: null as number | null,
+      seatEnd: null as number | null,
+      seatLabelEn: null as string | null,
+      seatLabelBn: null as string | null,
+    };
+
+    if (attendance === "attending") {
+      allocation = await allocateSeats(guests);
+    }
+
     const inserted = await db
       .insert(reservations)
       .values({
@@ -215,41 +231,38 @@ export async function POST(request: Request) {
       .returning();
 
     const record = inserted[0];
+
+    if (!record) {
+      throw new Error("Reservation was not created.");
+    }
+
     return NextResponse.json({
       ok: true,
       persisted: true,
       reservation: {
-        id: record?.id ?? Date.now(),
-        name,
-        phone,
-        guests,
-        attendance,
-        tableNumber: allocation.tableNumber,
-        seatStart: allocation.seatStart,
-        seatEnd: allocation.seatEnd,
-        seatLabelEn: allocation.seatLabelEn,
-        seatLabelBn: allocation.seatLabelBn,
-        message,
+        id: record.id,
+        name: record.name,
+        phone: record.phone,
+        guests: record.guests,
+        attendance: record.attendance,
+        tableNumber: record.tableNumber,
+        seatStart: record.seatStart,
+        seatEnd: record.seatEnd,
+        seatLabelEn: record.seatLabelEn,
+        seatLabelBn: record.seatLabelBn,
+        message: record.message,
       },
     });
   } catch (error) {
     console.error("reservation.persist.failed", error);
-    return NextResponse.json({
-      ok: true,
-      persisted: false,
-      reservation: {
-        id: Date.now(),
-        name,
-        phone,
-        guests,
-        attendance,
-        tableNumber: allocation.tableNumber,
-        seatStart: allocation.seatStart,
-        seatEnd: allocation.seatEnd,
-        seatLabelEn: allocation.seatLabelEn,
-        seatLabelBn: allocation.seatLabelBn,
-        message,
+
+    return NextResponse.json(
+      {
+        ok: false,
+        persisted: false,
+        error: "Reservation could not be saved. Please try again.",
       },
-    });
+      { status: 500 },
+    );
   }
 }
